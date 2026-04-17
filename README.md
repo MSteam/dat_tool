@@ -37,7 +37,7 @@ To compile the source code, you need a standard C compiler (`gcc`) and `make`. F
 
 Clone the repository and run `make`:
 
-`git clone https://github.com/yourusername/dat_tool.git`
+`git clone https://github.com/MSteam/dat_tool/dat_tool.git`
 `cd dat_tool`
 `make`
 
