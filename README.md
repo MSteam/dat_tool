@@ -1,6 +1,6 @@
 # DAT Tool (Digital Audio Tape CLI Utility)
 
-A lightweight, powerful command-line tool for Linux that allows you to read, extract, and bit-perfectly record standard PCM audio to Digital Audio Tape (DAT) using generic computer DDS (Digital Data Storage) SCSI tape drives. 
+A lightweight, powerful command-line tool for Linux that allows you to read, extract, and bit-perfectly record standard PCM audio to Digital Audio Tape (DAT) using computer DDS (Digital Data Storage) SCSI tape drives with audio firmware. 
 
 ## Features
 
