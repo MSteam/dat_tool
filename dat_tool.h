@@ -3,9 +3,11 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #define FRAME_SIZE 5822
 #define DATA_SIZE 5760
+#define LP_INPUT_SIZE 7680  // bytes of 16-bit PCM consumed per LP frame (1920 stereo pairs)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -31,13 +33,15 @@ typedef struct {
     int leadin_silence;
     int leadout_silence;
     int intertrack_silence;
+    int lp_mode;            // 1 = 32kHz LP (12-bit encoding); requires 32kHz input files
     char files[99][512];
     int file_count;
 } CueConfig;
 
 // Function prototypes
 void configure_tape_drive(int fd);
-int execute_extract_or_play(int fd, int mode_play);
+int execute_save(int fd);
+int execute_play(int fd, size_t buffer_size);
 int execute_record(int fd, const char *cue_file);
 
 #endif

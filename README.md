@@ -1,70 +1,119 @@
 # DAT Tool (Digital Audio Tape CLI Utility)
 
-A lightweight, powerful command-line tool for Linux that allows you to read, extract, and bit-perfectly record standard PCM audio to Digital Audio Tape (DAT) using computer DDS (Digital Data Storage) SCSI tape drives with audio firmware. 
+A lightweight command-line tool for Linux that lets you extract, play back, and record audio on Digital Audio Tape using computer DDS SCSI tape drives with audio firmware.
 
 ## Features
 
-* **Bit-Perfect Recording:** Write standard 16-bit Stereo WAV files directly to DAT tapes at 48kHz, 44.1kHz, or 32kHz (Standard Play).
-* **Automatic Subcode Generation:** Fully handles DAT subcodes during recording, including:
-  * Absolute Time (continuous tape timer).
-  * Program Time (individual track timer).
-  * Exact Track Numbering (01, 02, 03...).
-  * 9-second `START-ID` markers for automatic track seeking on consumer DAT Walkmans and decks.
-* **CUE Sheet Orchestration:** Easily configure playlists, lead-in/lead-out gaps, and intertrack silence using a simple text-based configuration file.
-* **Audio Extraction & Playback:** Dump raw DAT audio tracks to your hard drive or stream them directly from the tape to your sound card in real-time.
-* **SCMS-Free:** Automatically sets the Serial Copy Management System bits to `00` (Copy Permit), ensuring your tapes are DRM-free.
+**Extraction and Playback**
+- Extract tracks to individual WAV files (`track_01.wav`, `track_02.wav`, ...)
+- Real-time playback streamed directly from tape to your sound card
+- RAM read-ahead buffer for playback (default 128 MB, configurable) to prevent the tape drive from stopping and searching mid-playback
+- Press `q` during playback to stop
+- Supports both SP (16-bit PCM) and LP (12-bit non-linear) recordings
+- Automatically decodes 32 kHz LP frames to standard 16-bit PCM on extraction and playback
+- Displays track number, sample rate, and encoding mode for each track
 
-## Limitations
+**Recording**
+- Write 16-bit stereo WAV files to tape at 48 kHz, 44.1 kHz, or 32 kHz
+- 32 kHz LP mode: 12-bit non-linear encoding packs more audio per frame
+- Automatic subcode generation: absolute time, program time, track numbers
+- 9-second START-ID markers for automatic track search on consumer DAT decks and Walkmans
+- Configurable lead-in, lead-out, and intertrack silence
+- CUE sheet format for defining the track list and tape layout
+- SCMS bits set to Copy Permit (00) — no DRM
 
-* **No Long Play (LP / Mode III) Support:** This tool strictly operates in Standard Play (SP) mode. Standard DDS computer drives spin the head drum at 2000 RPM. The DAT LP specification requires a physical drum speed of 1000 RPM and 12-bit non-linear compression, which generic data streamers do not support natively.
-* **Input Format:** Files prepared for recording *must* be uncompressed PCM WAV, 16-bit, 2-channel (Stereo).
-* **Sample Rates:** Only standard DAT sample rates are supported: `48000 Hz`, `44100 Hz`, or `32000 Hz`.
+**Drive Detection**
+- Reads vendor, model, and firmware version from sysfs at startup
+- Reports `[COMPATIBLE]` or `[UNKNOWN]` against a built-in list of known-working drives and firmware versions
+- Exits immediately with a clear error if the drive cannot be configured for audio mode
 
-## Requirements & Dependencies
+## Requirements
 
-This tool is built for Linux and interacts directly with SCSI tape devices (`/dev/st0`). 
+Linux only. Requires `gcc` and `make` to build. For playback you need either `aplay` (alsa-utils) or `play` (sox).
 
-To compile the source code, you need a standard C compiler (`gcc`) and `make`. For real-time tape playback, you need either `aplay` (from alsa-utils) or `play` (from sox).
+Debian / Ubuntu / Linux Mint:
+```
+sudo apt install build-essential alsa-utils sox
+```
 
-**Debian / Ubuntu / Linux Mint:**
-`sudo apt update`
-`sudo apt install build-essential alsa-utils sox`
+Arch Linux / Manjaro:
+```
+sudo pacman -S base-devel alsa-utils sox
+```
 
-**Arch Linux / Manjaro:**
-`sudo pacman -S base-devel alsa-utils sox`
+## Compatible Drives
+
+The following drives have been verified to work with audio firmware. The tool reports compatibility status at startup for both the drive model and firmware version.
+
+**Archive 4320NT / 4330**
+Vendor: ARCHIVE, Product: Python 25601-XXX
+Compatible firmware: 2.63, 2.75
+
+**Conner/Seagate CTD-8000 / 4326NT**
+Vendor: ARCHIVE, Product: Python 01931-XXX
+Compatible firmware: 5AC, 5.56, 5.63
+
+**Conner 4530**
+Vendor: ARCHIVE, Product: Python 25501-XXX
+Compatible firmware: any
+
+**Sony SDT-9000**
+Vendor: SONY, Product: SDT-9000
+Compatible firmware: 12.2, 13.1
+
+`XXX` in the product ID is a 3-character hardware variant code that varies by unit — all variants of a listed model are treated as compatible.
+
+These drives must have audio firmware installed. A standard DDS data firmware will reject the audio density code (0x80) and the tool will exit with an error.
 
 ## Compilation
 
-Clone the repository and run `make`:
-
-`git clone https://github.com/MSteam/dat_tool`
-`cd dat_tool`
-`make`
+```
+git clone https://github.com/MSteam/dat_tool
+cd dat_tool
+make
+```
 
 ## Usage
 
-Ensure your user has read/write permissions to the tape drive (usually `/dev/st0` or `/dev/nst0`). You may need to add your user to the `tape` group or run the tool with `sudo`.
+Your user needs read/write access to the tape device (usually `/dev/st0` or `/dev/nst0`). Add yourself to the `tape` group or use `sudo`.
 
-### 1. Extract Tracks to Disk
-Reads the tape and saves audio as `track_01.wav`, `track_02.wav`, etc., in the current directory.
-`./dat_tool save /dev/st0`
+### Extract tracks to disk
 
-### 2. Live Playback
-Streams the audio directly from the tape drive to your sound card.
-`./dat_tool play /dev/st0`
+Reads the tape and saves each track as a WAV file in the current directory.
 
-### 3. Record Audio to Tape
-Records audio to the tape based on a configuration file.
-`./dat_tool write /dev/st0 tape.cue`
+```
+./dat_tool save /dev/st0
+```
 
-## The CUE Configuration File (`tape.cue`)
+### Live playback
 
-Before recording, you need to create a `tape.cue` file in the same directory. This file dictates the structure of your tape. 
+Streams audio from the tape directly to your sound card. The tape is read into a RAM buffer first to prevent mechanical stops during playback.
 
-**Example `tape.cue`:**
+```
+./dat_tool play /dev/st0
+./dat_tool play 256M /dev/st0
+./dat_tool play 1G /dev/st0
+```
+
+The buffer size is optional and defaults to 128 MB. Specify it before the device path using K, M, or G suffixes. Press `q` to stop.
+
+### Record audio to tape
+
+Records audio tracks defined in a CUE configuration file.
+
+```
+./dat_tool write /dev/st0 tape.cue
+```
+
+## The CUE Configuration File
+
+Create a `tape.cue` file before recording. It defines the track list and tape parameters.
+
+```ini
 [CONFIG]
 STARTID=ON
 PROGRAM_NUMBER=ON
+LP_MODE=OFF
 LEADIN_SILENCE=5
 LEADOUT_SILENCE=3
 INTERTRACK_SILENCE=3
@@ -73,15 +122,35 @@ INTERTRACK_SILENCE=3
 FILE_001=track1.wav
 FILE_002=track2.wav
 FILE_003=track3.wav
+```
 
-### Configuration Parameters:
-* `STARTID=ON/OFF`: Automatically generate a 9-second Start-ID marker at the beginning of each track.
-* `PROGRAM_NUMBER=ON/OFF`: Write sequential track numbers into the subcode.
-* `LEADIN_SILENCE`: Seconds of digital silence to write before the first track.
-* `LEADOUT_SILENCE`: Seconds of digital silence to write after the final track.
-* `INTERTRACK_SILENCE`: Seconds of digital silence to insert between tracks.
+**STARTID** — ON or OFF. Writes a 9-second Start-ID marker at the beginning of each track, enabling automatic track search on consumer DAT decks and Walkmans.
 
-## Credits & Acknowledgements
+**PROGRAM_NUMBER** — ON or OFF. Writes sequential track numbers (01, 02, 03...) into the subcode.
 
-* Original reverse engineering and hardware interface inspired by various DAT and SCSI tape documentation.
-* The source code logic, BCD subcode packing, and C implementation were developed with the assistance of Google's **Gemini AI**, transforming complex DAT specifications into a modern, robust C utility.
+**LP_MODE** — ON or OFF. Enables 32 kHz LP recording with 12-bit non-linear encoding. All input files must be 32 kHz when this is on. See LP Mode section below.
+
+**LEADIN_SILENCE** — seconds of digital silence before the first track.
+
+**LEADOUT_SILENCE** — seconds of digital silence after the last track.
+
+**INTERTRACK_SILENCE** — seconds of digital silence between tracks.
+
+### Input file requirements
+
+For SP mode (LP_MODE=OFF): uncompressed PCM WAV, 16-bit, stereo, at 48000, 44100, or 32000 Hz.
+
+For LP mode (LP_MODE=ON): uncompressed PCM WAV, 16-bit, stereo, at 32000 Hz only.
+
+## LP Mode
+
+`LP_MODE=ON` enables 12-bit non-linear encoding at 32 kHz. Each tape frame encodes 1920 stereo sample pairs (7680 bytes of 16-bit input PCM) into 5760 bytes using logarithmic companding. This doubles the recording capacity compared to SP 32 kHz mode.
+
+The frame rate changes from 33.33 fps (SP) to 16.67 fps (LP), and subcode timecode adjusts automatically. The encoding flag in Main-ID signals the format to the drive.
+
+On extraction and playback, LP frames are automatically decoded back to 16-bit PCM.
+
+## Credits
+
+- LP 32 kHz encoding/decoding tables adapted from **DATlib** © 1995–1996 Marcus Meissner, Friedrich-Alexander Universität Erlangen-Nürnberg (FAU).
+- Developed with assistance from Google Gemini AI and Anthropic Claude AI.

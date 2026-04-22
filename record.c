@@ -9,6 +9,102 @@
 int g_abs_frames = 0; // Absolute frame counter
 int g_rel_frames = 0; // Relative frame counter
 
+// --- LP 32kHz (12-bit non-linear) encoding ---
+// Adapted from DATlib (c) 1995-1996 Marcus Meissner, FAU IMMD4
+
+static short lp_c_44_to_32lp[DATA_SIZE];   // scatter-index table: source pos -> dest byte in frame
+static short lp_conv_16_to_12[65536];       // 16-bit linear -> 12-bit non-linear lookup
+static int   lp_tables_inited = 0;
+
+static int lp_c_16_to_12(int arg) {
+    int cnv = arg;
+    if (cnv > 0x8000)  cnv -= 0x10000;
+    if (cnv >=  0x4000) return  cnv/64  + 1536;
+    if (cnv >=  0x2000) return  cnv/32  + 1280;
+    if (cnv >=  0x1000) return  cnv/16  + 1024;
+    if (cnv >=  0x0800) return  cnv/8   +  768;
+    if (cnv >=  0x0400) return  cnv/4   +  512;
+    if (cnv >=  0x0200) return  cnv/2   +  256;
+    if (cnv >= -0x0200) return  cnv;
+    if (cnv >= -0x0400) return (cnv+1)/2  -  257;
+    if (cnv >= -0x0800) return (cnv+1)/4  -  513;
+    if (cnv >= -0x1000) return (cnv+1)/8  -  769;
+    if (cnv >= -0x2000) return (cnv+1)/16 - 1025;
+    if (cnv >= -0x4000) return (cnv+1)/32 - 1281;
+    return (cnv+1)/64 - 1537;
+}
+
+static void lp_init_tables(void) {
+    short datbuf[2][128][32];
+    int xx[DATA_SIZE];
+    int i;
+
+    memset(lp_c_44_to_32lp, 0, sizeof(lp_c_44_to_32lp));
+    memset(datbuf, 0, sizeof(datbuf));
+
+    for (i = 0; i < DATA_SIZE; i++) xx[i] = i;
+
+    // Swap pairs separated by 2880 positions
+    for (i = DATA_SIZE / 2; i-- > 0; ) {
+        if ((i % 6) >= 3) {
+            int tmp = xx[i]; xx[i] = xx[i + 2880]; xx[i + 2880] = tmp;
+        }
+    }
+
+    // Build reverse-index table from 44kHz frame geometry
+    for (i = 0; i < 1440 * 4; i++) {
+        int I = i / 4, A = (i & 2) / 2, U = 1 - (i % 2);
+        short X = A % 2;
+        short Y = (I % 52) + 75 * (I % 2) + (I / 832);
+        short Z = 2 * (U + (I / 52)) - ((I / 52) % 2) - 32 * (I / 832);
+        datbuf[X][Y][Z] = (short)i;
+    }
+
+    // Build the scatter table used during encoding
+    for (i = 0; i < DATA_SIZE; i++) {
+        int S = i % 3, I = i / 3, A = I / 960;
+        int U = (3 * (I / 2) + S) % 2;
+        int J = 2 * ((3 * (I / 2) + S) / 2) + (I % 2) - (1440 * A);
+        short X = (short)((A + J) % 2);
+        short Y = (short)((J % 52) + 75 * (J % 2) + J / 832);
+        short Z = (short)(2 * (U + (J / 52)) - ((J / 52) % 2) - 32 * (J / 832));
+        lp_c_44_to_32lp[xx[i]] = datbuf[X][Y][Z];
+    }
+
+    for (i = 0; i < 65536; i++)
+        lp_conv_16_to_12[i] = (short)lp_c_16_to_12(i);
+
+    lp_tables_inited = 1;
+}
+
+// Encode 7680 bytes of 16-bit LE stereo PCM into 5760 bytes of 12-bit packed audio.
+static void encode_lp_frame(const unsigned char *pcm_in, unsigned char *frame_out) {
+    const unsigned short *inbuf = (const unsigned short *)pcm_in;
+    int i, j = 0;
+    memset(frame_out, 0, DATA_SIZE);
+    // 1920 stereo pairs: each pair becomes 3 bytes via 12-bit non-linear + scatter
+    for (i = 0; i < LP_INPUT_SIZE / 2; i += 2) {
+        int left  = lp_conv_16_to_12[inbuf[i]];
+        int right = lp_conv_16_to_12[inbuf[i + 1]];
+        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(left >> 4);
+        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(((left & 0xf) << 4) | (right & 0xf));
+        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(right >> 4);
+    }
+}
+
+// Timecode for LP 32kHz: 1920 samples/frame at 32kHz = 50 frames per 3 seconds (16.67 fps)
+static void frames_to_time_lp(int total_frames, int *h, int *m, int *s, int *f) {
+    int blocks = total_frames / 50;
+    int rem    = total_frames % 50;
+    int total_sec = blocks * 3;
+    if      (rem < 17) { *f = rem;       }
+    else if (rem < 34) { total_sec += 1; *f = rem - 17; }
+    else               { total_sec += 2; *f = rem - 34; }
+    *h = total_sec / 3600;
+    *m = (total_sec % 3600) / 60;
+    *s = total_sec % 60;
+}
+
 // Parse the CUE sheet configuration
 void parse_cuefile(const char *filename, CueConfig *cfg) {
     memset(cfg, 0, sizeof(CueConfig));
@@ -24,6 +120,7 @@ void parse_cuefile(const char *filename, CueConfig *cfg) {
         if (!in_files) {
             if (strstr(line, "STARTID=ON")) cfg->startid = 1;
             else if (strstr(line, "PROGRAM_NUMBER=ON")) cfg->program_number = 1;
+            else if (strstr(line, "LP_MODE=ON")) cfg->lp_mode = 1;
             else if (strstr(line, "LEADIN_SILENCE=")) sscanf(line, "LEADIN_SILENCE=%d", &cfg->leadin_silence);
             else if (strstr(line, "LEADOUT_SILENCE=")) sscanf(line, "LEADOUT_SILENCE=%d", &cfg->leadout_silence);
             else if (strstr(line, "INTERTRACK_SILENCE=")) sscanf(line, "INTERTRACK_SILENCE=%d", &cfg->intertrack_silence);
@@ -45,6 +142,7 @@ void validate_and_print_playlist(const CueConfig *cfg) {
     printf("========================================\n");
     printf(" START-ID (Auto)    : %s\n", cfg->startid ? "ON" : "OFF");
     printf(" PROGRAM NUMBER     : %s\n", cfg->program_number ? "ON" : "OFF");
+    printf(" RECORDING MODE     : %s\n", cfg->lp_mode ? "32kHz LP (12-bit)" : "Standard Play (SP)");
     printf(" LEAD-IN SILENCE    : %d seconds\n", cfg->leadin_silence);
     printf(" INTERTRACK SILENCE : %d seconds\n", cfg->intertrack_silence);
     printf(" LEAD-OUT SILENCE   : %d seconds\n", cfg->leadout_silence);
@@ -82,6 +180,10 @@ void validate_and_print_playlist(const CueConfig *cfg) {
         if (hdr.sample_rate != 48000 && hdr.sample_rate != 44100 && hdr.sample_rate != 32000) {
             fprintf(stderr, "\n[FATAL ERROR] '%s' has unsupported sample rate (%d Hz).\n", cfg->files[i], hdr.sample_rate);
             fprintf(stderr, "Supported DAT rates: 48000 Hz, 44100 Hz, 32000 Hz.\n");
+            exit(1);
+        }
+        if (cfg->lp_mode && hdr.sample_rate != 32000) {
+            fprintf(stderr, "\n[FATAL ERROR] LP_MODE=ON requires 32000 Hz input, but '%s' is %d Hz.\n", cfg->files[i], hdr.sample_rate);
             exit(1);
         }
 
@@ -154,12 +256,16 @@ void write_pack(unsigned char *pack, int item, int pno, int h, int m, int s, int
     pack[7] = pack[0] ^ pack[1] ^ pack[2] ^ pack[3] ^ pack[4] ^ pack[5] ^ pack[6];
 }
 
-void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno, int start_id) {
+void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno, int start_id, int lp_mode) {
     unsigned char frame[FRAME_SIZE];
     memset(frame, 0, FRAME_SIZE);
 
-    int payload_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
-    memcpy(frame, audio_data, payload_size);
+    if (lp_mode) {
+        encode_lp_frame(audio_data, frame);
+    } else {
+        int payload_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
+        memcpy(frame, audio_data, payload_size);
+    }
 
     unsigned char *scode = frame + DATA_SIZE;
     unsigned char *packs = scode;
@@ -167,13 +273,17 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
     unsigned char *mainid = subid + 4;
 
     int a_h, a_m, a_s, a_f;
-    frames_to_time(g_abs_frames, &a_h, &a_m, &a_s, &a_f);
-
     int r_h, r_m, r_s, r_f;
-    frames_to_time(g_rel_frames, &r_h, &r_m, &r_s, &r_f);
+    if (lp_mode) {
+        frames_to_time_lp(g_abs_frames, &a_h, &a_m, &a_s, &a_f);
+        frames_to_time_lp(g_rel_frames, &r_h, &r_m, &r_s, &r_f);
+    } else {
+        frames_to_time(g_abs_frames, &a_h, &a_m, &a_s, &a_f);
+        frames_to_time(g_rel_frames, &r_h, &r_m, &r_s, &r_f);
+    }
 
-    write_pack(&packs[0], 1, pno, r_h, r_m, r_s, r_f);
-    write_pack(&packs[8], 2, pno, a_h, a_m, a_s, a_f);
+    write_pack(&packs[0],  1, pno, r_h, r_m, r_s, r_f);
+    write_pack(&packs[8],  2, pno, a_h, a_m, a_s, a_f);
     write_pack(&packs[16], 1, pno, r_h, r_m, r_s, r_f);
     write_pack(&packs[24], 2, pno, a_h, a_m, a_s, a_f);
     write_pack(&packs[32], 1, pno, r_h, r_m, r_s, r_f);
@@ -191,12 +301,12 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
     }
     subid[3] = subid[0] ^ subid[1] ^ subid[2];
 
-    // --- Main-ID Setup (SP MODE) ---
+    // --- Main-ID Setup ---
     int sr_bits = 0;
     if (sample_rate == 44100) sr_bits = 1;
     else if (sample_rate == 32000) sr_bits = 2;
-    mainid[0] = (sr_bits << 2) | 0x00;
-    mainid[1] = 0x00;
+    mainid[0] = (unsigned char)((sr_bits << 2) | 0x00);
+    mainid[1] = lp_mode ? 0x40 : 0x00;  // bit 6 = encoding: 0=16-bit SP, 1=12-bit LP
 
     if (write(fd, frame, FRAME_SIZE) != FRAME_SIZE) {
         perror("\n\n[FATAL ERROR] Tape drive rejected the write command");
@@ -207,21 +317,22 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
     g_rel_frames++;
 }
 
-void write_silence(int fd, int seconds, int sample_rate, const char *zone) {
+void write_silence(int fd, int seconds, int sample_rate, const char *zone, int lp_mode) {
     if (seconds <= 0) return;
 
     g_rel_frames = 0;
     printf("Writing %d sec %s silence...\n", seconds, zone);
 
-    int total_frames = (seconds * 100) / 3;
-    unsigned char empty[DATA_SIZE];
-    memset(empty, 0, DATA_SIZE);
+    // LP: 50 frames/3 s (16.67 fps);  SP: 100 frames/3 s (33.33 fps)
+    int total_frames = lp_mode ? (seconds * 50) / 3 : (seconds * 100) / 3;
+    unsigned char empty[LP_INPUT_SIZE];
+    memset(empty, 0, sizeof(empty));
     int last_printed_sec = -1;
 
     for (int i = 0; i < total_frames; i++) {
-        write_dat_frame(fd, empty, sample_rate, 0, 0);
+        write_dat_frame(fd, empty, sample_rate, 0, 0, lp_mode);
 
-        int current_sec = (i * 3) / 100;
+        int current_sec = lp_mode ? (i * 3) / 50 : (i * 3) / 100;
         if (current_sec != last_printed_sec) {
             printf("\r[SILENCE] Time: %02d / %02d sec", current_sec, seconds);
             fflush(stdout);
@@ -241,24 +352,32 @@ void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
 
     int sample_rate = hdr.sample_rate;
     int channels = hdr.channels;
-    int payload_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
+    int lp_mode = cfg->lp_mode;
 
-    unsigned char buf[DATA_SIZE];
+    // LP mode consumes 7680 bytes of PCM per frame (1920 stereo pairs at 32kHz)
+    int read_size;
+    if (lp_mode) {
+        read_size = LP_INPUT_SIZE;
+    } else {
+        read_size = (sample_rate == 48000) ? 5760 : (sample_rate == 44100 ? 5292 : 3840);
+    }
+
+    unsigned char buf[LP_INPUT_SIZE];
     int bytes_read;
     int start_id_written = 0;
     uint32_t current_audio_bytes = 0;
     int last_printed_second = -1;
-    int max_start_id_frames = 300;
+    int max_start_id_frames = lp_mode ? 150 : 300;  // ~9 sec worth at respective frame rates
     g_rel_frames = 0;
 
-    while ((bytes_read = fread(buf, 1, payload_size, wav)) > 0) {
-        if (bytes_read < payload_size) memset(buf + bytes_read, 0, payload_size - bytes_read);
+    while ((bytes_read = fread(buf, 1, read_size, wav)) > 0) {
+        if (bytes_read < read_size) memset(buf + bytes_read, 0, read_size - bytes_read);
 
         int do_start_id = (cfg->startid && start_id_written < max_start_id_frames) ? 1 : 0;
-        write_dat_frame(fd, buf, sample_rate, cfg->program_number ? pno : 0, do_start_id);
+        write_dat_frame(fd, buf, sample_rate, cfg->program_number ? pno : 0, do_start_id, lp_mode);
         start_id_written++;
 
-        current_audio_bytes += payload_size;
+        current_audio_bytes += bytes_read;
         uint32_t total_seconds = current_audio_bytes / (sample_rate * channels * 2);
 
         if ((int)total_seconds != last_printed_second) {
@@ -278,6 +397,9 @@ int execute_record(int fd, const char *cue_file) {
     CueConfig cfg;
     parse_cuefile(cue_file, &cfg);
 
+    if (cfg.lp_mode && !lp_tables_inited)
+        lp_init_tables();
+
     // Validate files and display the playlist with durations
     validate_and_print_playlist(&cfg);
 
@@ -293,16 +415,18 @@ int execute_record(int fd, const char *cue_file) {
 
     g_abs_frames = 0;
 
-    write_silence(fd, cfg.leadin_silence, 44100, "LEAD-IN");
+    // Silence regions use the same mode as the audio tracks
+    int sr_silence = cfg.lp_mode ? 32000 : 44100;
+    write_silence(fd, cfg.leadin_silence, sr_silence, "LEAD-IN", cfg.lp_mode);
 
     for (int i = 0; i < cfg.file_count; i++) {
         write_wav_file(fd, cfg.files[i], i + 1, &cfg);
         if (i < cfg.file_count - 1 && cfg.intertrack_silence > 0) {
-            write_silence(fd, cfg.intertrack_silence, 44100, "INTERTRACK");
+            write_silence(fd, cfg.intertrack_silence, sr_silence, "INTERTRACK", cfg.lp_mode);
         }
     }
 
-    write_silence(fd, cfg.leadout_silence, 44100, "LEAD-OUT");
+    write_silence(fd, cfg.leadout_silence, sr_silence, "LEAD-OUT", cfg.lp_mode);
 
     mt_cmd.mt_op = MTWEOF; mt_cmd.mt_count = 1;
     ioctl(fd, MTIOCTOP, &mt_cmd);
