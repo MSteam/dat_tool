@@ -16,7 +16,6 @@ static const struct { const char *vendor; const char *product_prefix; } known_dr
 };
 #define NUM_KNOWN_DRIVES (sizeof(known_drives) / sizeof(known_drives[0]))
 
-// Known compatible firmware versions: vendor + product prefix + exact revision string
 static const struct { const char *vendor; const char *product_prefix; const char *revision; } known_firmwares[] = {
     { "ARCHIVE", "Python 25601-", "2.63" },
     { "ARCHIVE", "Python 25601-", "2.75" },
@@ -27,6 +26,52 @@ static const struct { const char *vendor; const char *product_prefix; const char
     { "SONY",    "SDT-9000",      "12.2" },
 };
 #define NUM_KNOWN_FIRMWARES (sizeof(known_firmwares) / sizeof(known_firmwares[0]))
+
+// --- Shared LP scatter/gather table (used by both extract and record) ---
+// Adapted from DATlib (c) 1995-1996 Marcus Meissner, FAU IMMD4
+
+short g_lp_scatter[DATA_SIZE];
+static int g_lp_scatter_inited = 0;
+
+void lp_init_scatter(void) {
+    if (g_lp_scatter_inited) return;
+
+    short datbuf[2][128][32];
+    int   xx[DATA_SIZE];
+
+    memset(g_lp_scatter, 0, sizeof(g_lp_scatter));
+    memset(datbuf, 0, sizeof(datbuf));
+
+    for (int i = 0; i < DATA_SIZE; i++) xx[i] = i;
+
+    for (int i = DATA_SIZE / 2; i-- > 0; ) {
+        if ((i % 6) >= 3) {
+            int tmp = xx[i]; xx[i] = xx[i + 2880]; xx[i + 2880] = tmp;
+        }
+    }
+
+    for (int i = 0; i < 1440 * 4; i++) {
+        int I = i / 4, A = (i & 2) / 2, U = 1 - (i % 2);
+        short X = A % 2;
+        short Y = (I % 52) + 75 * (I % 2) + (I / 832);
+        short Z = 2 * (U + (I / 52)) - ((I / 52) % 2) - 32 * (I / 832);
+        datbuf[X][Y][Z] = (short)i;
+    }
+
+    for (int i = 0; i < DATA_SIZE; i++) {
+        int S = i % 3, I = i / 3, A = I / 960;
+        int U = (3 * (I / 2) + S) % 2;
+        int J = 2 * ((3 * (I / 2) + S) / 2) + (I % 2) - (1440 * A);
+        short X = (short)((A + J) % 2);
+        short Y = (short)((J % 52) + 75 * (J % 2) + J / 832);
+        short Z = (short)(2 * (U + (J / 52)) - ((J / 52) % 2) - 32 * (J / 832));
+        g_lp_scatter[xx[i]] = datbuf[X][Y][Z];
+    }
+
+    g_lp_scatter_inited = 1;
+}
+
+// --- Drive detection ---
 
 static void rtrim(char *s) {
     int len = (int)strlen(s);
@@ -48,7 +93,6 @@ static int read_sysfs_attr(const char *devname, const char *attr, char *out, int
 static void print_drive_info(const char *dev_path) {
     char vendor[16] = {0}, model[32] = {0}, rev[8] = {0};
 
-    // Extract basename: "/dev/st0" -> "st0", "/dev/nst0" -> "nst0"
     const char *devname = strrchr(dev_path, '/');
     devname = devname ? devname + 1 : dev_path;
 
@@ -61,7 +105,6 @@ static void print_drive_info(const char *dev_path) {
         return;
     }
 
-    // Check drive compatibility
     int drive_ok = 0;
     for (int i = 0; i < (int)NUM_KNOWN_DRIVES; i++) {
         if (strcmp(vendor, known_drives[i].vendor) == 0 &&
@@ -72,7 +115,6 @@ static void print_drive_info(const char *dev_path) {
         }
     }
 
-    // Check firmware compatibility
     int fw_ok = 0;
     if (have_rev) {
         for (int i = 0; i < (int)NUM_KNOWN_FIRMWARES; i++) {
@@ -100,7 +142,7 @@ void configure_tape_drive(int fd) {
     printf("Initializing tape drive (MTLOAD)...\n");
     mt_cmd.mt_op = MTLOAD;
     mt_cmd.mt_count = 1;
-    ioctl(fd, MTIOCTOP, &mt_cmd);  // ignore: tape may already be loaded
+    ioctl(fd, MTIOCTOP, &mt_cmd);
 
     sleep(2);
 
@@ -135,6 +177,8 @@ void configure_tape_drive(int fd) {
     printf("----------------------------------------\n");
 }
 
+// --- Argument parsing ---
+
 static size_t parse_buffer_size(const char *s) {
     if (!s) return 0;
     size_t val = 0;
@@ -150,46 +194,102 @@ static size_t parse_buffer_size(const char *s) {
     return 0;
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "  %s play  [params] /dev/st0\n", prog);
+    fprintf(stderr, "  %s save  [params] /dev/st0 [prefix]    (default prefix 'track')\n", prog);
+    fprintf(stderr, "  %s write [params] /dev/st0 tape.cue\n", prog);
+    fprintf(stderr, "\nParameters (name=value, any order, before device path):\n");
+    fprintf(stderr, "  dat_batch=N   frames per write() syscall  (write only; 1..%d, default 1)\n", MAX_BATCH);
+    fprintf(stderr, "  buffer=SIZE   RAM ring buffer size        (e.g. 4M, 64M, 1G; default 4M)\n");
+    fprintf(stderr, "\nExamples:\n");
+    fprintf(stderr, "  %s save  dat_batch=2 /dev/st0 mytape\n", prog);
+    fprintf(stderr, "  %s play  dat_batch=2 buffer=64M /dev/st0\n", prog);
+    fprintf(stderr, "  %s write dat_batch=2 /dev/st0 tape.cue\n", prog);
+}
+
+// Parse named params (name=value) from argv[start..argc), stopping at first
+// positional arg. Advances *idx to first positional arg. Returns 0 on success.
+static int parse_named_params(int argc, char *argv[], int *idx,
+                              size_t *buffer_size, int *dat_batch) {
+    int i = *idx;
+    while (i < argc) {
+        const char *a = argv[i];
+        const char *eq = strchr(a, '=');
+        if (!eq) break;
+
+        size_t klen = (size_t)(eq - a);
+        const char *val = eq + 1;
+
+        if (klen == 9 && strncmp(a, "dat_batch", 9) == 0) {
+            int b = atoi(val);
+            if (b < 1 || b > MAX_BATCH) {
+                fprintf(stderr, "Error: dat_batch must be 1..%d\n", MAX_BATCH);
+                return -1;
+            }
+            *dat_batch = b;
+        } else if (klen == 6 && strncmp(a, "buffer", 6) == 0) {
+            size_t sz = parse_buffer_size(val);
+            if (sz == 0) {
+                fprintf(stderr, "Error: invalid buffer size '%s' (use e.g. 4M, 64M, 1G)\n", val);
+                return -1;
+            }
+            *buffer_size = sz;
+        } else {
+            fprintf(stderr, "Error: unknown parameter '%.*s' (expected dat_batch= or buffer=)\n",
+                    (int)klen, a);
+            return -1;
+        }
+        i++;
+    }
+    *idx = i;
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  %s play  [bufsize] /dev/st0   (e.g. 256M, 1G; default 256M)\n", argv[0]);
-        fprintf(stderr, "  %s save  /dev/st0\n", argv[0]);
-        fprintf(stderr, "  %s write /dev/st0 tape.cue\n", argv[0]);
+        print_usage(argv[0]);
         return 1;
     }
 
-    int mode_write = (strcmp(argv[1], "write") == 0);
     int mode_play  = (strcmp(argv[1], "play")  == 0);
     int mode_save  = (strcmp(argv[1], "save")  == 0);
+    int mode_write = (strcmp(argv[1], "write") == 0);
 
-    if (!mode_write && !mode_play && !mode_save) {
-        fprintf(stderr, "Unknown mode: %s\n", argv[1]);
+    if (!mode_play && !mode_save && !mode_write) {
+        fprintf(stderr, "Unknown mode: %s\n\n", argv[1]);
+        print_usage(argv[0]);
         return 1;
     }
 
-    // Determine device path and optional buffer size
-    const char *dev_path = NULL;
-    const char *cue_path = NULL;
-    size_t      buf_size = 0;
+    size_t      buffer_size = 0;
+    int         dat_batch   = 1;
+    const char *dev_path    = NULL;
+    const char *cue_path    = NULL;
+    const char *prefix      = "track";
 
-    if (mode_play) {
-        // dat_tool play [bufsize] /dev/st0
-        if (argc >= 4 && argv[2][0] >= '0' && argv[2][0] <= '9') {
-            buf_size = parse_buffer_size(argv[2]);
-            dev_path = argv[3];
-        } else {
-            dev_path = argv[2];
-        }
-    } else if (mode_write) {
-        if (argc < 4) {
-            fprintf(stderr, "Error: CUE file required for write mode.\n");
+    int idx = 2;
+    if (parse_named_params(argc, argv, &idx, &buffer_size, &dat_batch) < 0)
+        return 1;
+
+    // Positional: device path
+    if (idx >= argc) {
+        fprintf(stderr, "Error: device path required.\n\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+    dev_path = argv[idx++];
+
+    // Mode-specific positional args
+    if (mode_write) {
+        if (idx >= argc) {
+            fprintf(stderr, "Error: CUE file required for write mode.\n\n");
+            print_usage(argv[0]);
             return 1;
         }
-        dev_path = argv[2];
-        cue_path = argv[3];
-    } else {
-        dev_path = argv[2];
+        cue_path = argv[idx++];
+    } else if (mode_save) {
+        if (idx < argc) prefix = argv[idx++];
     }
 
     int fd = open(dev_path, mode_write ? O_RDWR : O_RDONLY);
@@ -202,9 +302,9 @@ int main(int argc, char *argv[]) {
     configure_tape_drive(fd);
 
     int result = 0;
-    if (mode_write)     result = execute_record(fd, cue_path);
-    else if (mode_play) result = execute_play(fd, buf_size);
-    else                result = execute_save(fd);
+    if (mode_write)     result = execute_record(fd, cue_path, buffer_size, dat_batch);
+    else if (mode_play) result = execute_play(fd, buffer_size, dat_batch);
+    else                result = execute_save(fd, prefix, buffer_size, dat_batch);
 
     close(fd);
     return result;

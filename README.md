@@ -5,17 +5,19 @@ A lightweight command-line tool for Linux that lets you extract, play back, and 
 ## Features
 
 **Extraction and Playback**
-- Extract tracks to individual WAV files (`track_01.wav`, `track_02.wav`, ...)
+- Extract tracks to individual WAV files with a customizable filename prefix
 - Real-time playback streamed directly from tape to your sound card
-- RAM read-ahead buffer for playback (default 128 MB, configurable) to prevent the tape drive from stopping and searching mid-playback
+- RAM read-ahead buffer to decouple disk and audio output from the tape mechanism
 - Press `q` during playback to stop
 - Supports both SP (16-bit PCM) and LP (12-bit non-linear) recordings
-- Automatically decodes 32 kHz LP frames to standard 16-bit PCM on extraction and playback
+- Automatically decodes 32 kHz LP frames to standard 16-bit PCM
 - Displays track number, sample rate, and encoding mode for each track
 
 **Recording**
 - Write 16-bit stereo WAV files to tape at 48 kHz, 44.1 kHz, or 32 kHz
 - 32 kHz LP mode: 12-bit non-linear encoding packs more audio per frame
+- RAM ring buffer + dedicated writer thread to keep the drive's internal buffer fed
+- Optional batched writes (`dat_batch=N`) to reduce SCSI command rate on slow links such as USB 1.1 → SCSI bridges
 - Automatic subcode generation: absolute time, program time, track numbers
 - 9-second START-ID markers for automatic track search on consumer DAT decks and Walkmans
 - Configurable lead-in, lead-out, and intertrack silence
@@ -77,25 +79,36 @@ make
 
 Your user needs read/write access to the tape device (usually `/dev/st0` or `/dev/nst0`). Add yourself to the `tape` group or use `sudo`.
 
+General syntax:
+```
+./dat_tool MODE [params] /dev/st0 [mode-specific args]
+```
+
+Optional named parameters appear in any order, before the device path:
+
+- **`dat_batch=N`** — frames per `write()` syscall (1..32, default 1). Effective on **write only**. See "Batched writes" below.
+- **`buffer=SIZE`** — RAM ring buffer size, e.g. `4M`, `64M`, `1G`. Default `4M`.
+
 ### Extract tracks to disk
 
-Reads the tape and saves each track as a WAV file in the current directory.
+Reads the tape and saves each track as a WAV file in the current directory. By default files are named `track_01.wav`, `track_02.wav`, ... You can supply a custom prefix as the last argument.
 
 ```
-./dat_tool save /dev/st0
+./dat_tool save /dev/st0                  # → track_01.wav, track_02.wav, ...
+./dat_tool save /dev/st0 mytape           # → mytape_01.wav, mytape_02.wav, ...
+./dat_tool save buffer=16M /dev/st0 album # 16 MB ring buffer, prefix "album"
 ```
 
 ### Live playback
 
-Streams audio from the tape directly to your sound card. The tape is read into a RAM buffer first to prevent mechanical stops during playback.
+Streams audio from the tape directly to your sound card. The tape is read into a RAM buffer to absorb brief stalls.
 
 ```
 ./dat_tool play /dev/st0
-./dat_tool play 256M /dev/st0
-./dat_tool play 1G /dev/st0
+./dat_tool play buffer=64M /dev/st0
 ```
 
-The buffer size is optional and defaults to 128 MB. Specify it before the device path using K, M, or G suffixes. Press `q` to stop.
+Press `q` to stop.
 
 ### Record audio to tape
 
@@ -103,7 +116,19 @@ Records audio tracks defined in a CUE configuration file.
 
 ```
 ./dat_tool write /dev/st0 tape.cue
+./dat_tool write dat_batch=2 /dev/st0 tape.cue
+./dat_tool write dat_batch=2 buffer=64M /dev/st0 tape.cue
 ```
+
+## Batched writes (`dat_batch=N`)
+
+On slow host interfaces such as USB 1.1 → SCSI bridges, the per-command protocol overhead can prevent the host from feeding the drive's internal buffer fast enough at the drive's full write speed. The drive then stops, rewinds slightly, and resumes — so-called "shoe-shining."
+
+`dat_batch=N` makes the writer thread emit `N` DAT frames in a single `write()` syscall. The drive splits each oversized variable-length block into `N` proper 5822-byte DAT audio frames internally, but the host only paid SCSI command overhead once. The output tape is bit-identical to a non-batched recording.
+
+In practice, `dat_batch=2` is often enough to eliminate write-side shoe-shining on USB 1.1 setups. Tested values: 1..32.
+
+A note on reads: `dat_batch` has no effect on `play` or `save`, because audio-firmware DAT drives lock to one frame per SCSI READ command. Reducing read command rate would require raw SCSI passthrough (not currently implemented) or a faster host interface.
 
 ## The CUE Configuration File
 

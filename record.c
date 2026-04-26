@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mtio.h>
 #include "dat_tool.h"
@@ -9,12 +10,92 @@
 int g_abs_frames = 0; // Absolute frame counter
 int g_rel_frames = 0; // Relative frame counter
 
+#define DEFAULT_BUFFER_SIZE (4UL * 1024 * 1024)
+
+// --- Write ring buffer (keeps drive's internal buffer full on slow links) ---
+
+#define MAX_BATCH 32
+
+typedef struct {
+    unsigned char  *data;
+    size_t          cap;     // frames
+    size_t          head;    // monotonic frames pushed
+    size_t          tail;    // monotonic frames written
+    int             batch;   // frames per write() syscall (1..MAX_BATCH)
+    volatile int    eof;
+    volatile int    err;
+    int             fd;
+    pthread_t       thread;
+    pthread_mutex_t lock;
+    pthread_cond_t  avail;
+    pthread_cond_t  space;
+} WriteRing;
+
+static WriteRing *g_write_ring = NULL;
+
+static void *tape_writer_thread(void *arg) {
+    WriteRing *r = (WriteRing *)arg;
+    unsigned char buf[MAX_BATCH * FRAME_SIZE];
+    int batch_n = r->batch;
+
+    for (;;) {
+        pthread_mutex_lock(&r->lock);
+        while (r->head == r->tail && !r->eof)
+            pthread_cond_wait(&r->avail, &r->lock);
+        if (r->head == r->tail) {
+            pthread_mutex_unlock(&r->lock);
+            break;
+        }
+        size_t avail = r->head - r->tail;
+        size_t take  = (avail < (size_t)batch_n) ? avail : (size_t)batch_n;
+        for (size_t i = 0; i < take; i++) {
+            memcpy(buf + i * FRAME_SIZE,
+                   r->data + ((r->tail + i) % r->cap) * FRAME_SIZE,
+                   FRAME_SIZE);
+        }
+        r->tail += take;
+        pthread_cond_broadcast(&r->space);
+        pthread_mutex_unlock(&r->lock);
+
+        size_t bytes = take * FRAME_SIZE;
+        if ((size_t)write(r->fd, buf, bytes) != bytes) {
+            pthread_mutex_lock(&r->lock);
+            r->err = 1;
+            pthread_cond_broadcast(&r->space);
+            pthread_mutex_unlock(&r->lock);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int ring_put(WriteRing *r, const unsigned char *frame) {
+    pthread_mutex_lock(&r->lock);
+    while ((r->head - r->tail) >= r->cap && !r->err)
+        pthread_cond_wait(&r->space, &r->lock);
+    if (r->err) { pthread_mutex_unlock(&r->lock); return -1; }
+    memcpy(r->data + (r->head % r->cap) * FRAME_SIZE, frame, FRAME_SIZE);
+    r->head++;
+    pthread_cond_signal(&r->avail);
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
+
+static int ring_finish(WriteRing *r) {
+    pthread_mutex_lock(&r->lock);
+    r->eof = 1;
+    pthread_cond_signal(&r->avail);
+    pthread_mutex_unlock(&r->lock);
+    pthread_join(r->thread, NULL);
+    return r->err ? -1 : 0;
+}
+
 // --- LP 32kHz (12-bit non-linear) encoding ---
+// Uses g_lp_scatter from main.c as the scatter table (same table for encode and decode).
 // Adapted from DATlib (c) 1995-1996 Marcus Meissner, FAU IMMD4
 
-static short lp_c_44_to_32lp[DATA_SIZE];   // scatter-index table: source pos -> dest byte in frame
-static short lp_conv_16_to_12[65536];       // 16-bit linear -> 12-bit non-linear lookup
-static int   lp_tables_inited = 0;
+static short lp_conv_16_to_12[65536];   // 16-bit linear -> 12-bit non-linear lookup
+static int   lp_encode_inited = 0;
 
 static int lp_c_16_to_12(int arg) {
     int cnv = arg;
@@ -34,61 +115,24 @@ static int lp_c_16_to_12(int arg) {
     return (cnv+1)/64 - 1537;
 }
 
-static void lp_init_tables(void) {
-    short datbuf[2][128][32];
-    int xx[DATA_SIZE];
-    int i;
-
-    memset(lp_c_44_to_32lp, 0, sizeof(lp_c_44_to_32lp));
-    memset(datbuf, 0, sizeof(datbuf));
-
-    for (i = 0; i < DATA_SIZE; i++) xx[i] = i;
-
-    // Swap pairs separated by 2880 positions
-    for (i = DATA_SIZE / 2; i-- > 0; ) {
-        if ((i % 6) >= 3) {
-            int tmp = xx[i]; xx[i] = xx[i + 2880]; xx[i + 2880] = tmp;
-        }
-    }
-
-    // Build reverse-index table from 44kHz frame geometry
-    for (i = 0; i < 1440 * 4; i++) {
-        int I = i / 4, A = (i & 2) / 2, U = 1 - (i % 2);
-        short X = A % 2;
-        short Y = (I % 52) + 75 * (I % 2) + (I / 832);
-        short Z = 2 * (U + (I / 52)) - ((I / 52) % 2) - 32 * (I / 832);
-        datbuf[X][Y][Z] = (short)i;
-    }
-
-    // Build the scatter table used during encoding
-    for (i = 0; i < DATA_SIZE; i++) {
-        int S = i % 3, I = i / 3, A = I / 960;
-        int U = (3 * (I / 2) + S) % 2;
-        int J = 2 * ((3 * (I / 2) + S) / 2) + (I % 2) - (1440 * A);
-        short X = (short)((A + J) % 2);
-        short Y = (short)((J % 52) + 75 * (J % 2) + J / 832);
-        short Z = (short)(2 * (U + (J / 52)) - ((J / 52) % 2) - 32 * (J / 832));
-        lp_c_44_to_32lp[xx[i]] = datbuf[X][Y][Z];
-    }
-
-    for (i = 0; i < 65536; i++)
+static void lp_encode_init(void) {
+    if (lp_encode_inited) return;
+    lp_init_scatter();
+    for (int i = 0; i < 65536; i++)
         lp_conv_16_to_12[i] = (short)lp_c_16_to_12(i);
-
-    lp_tables_inited = 1;
+    lp_encode_inited = 1;
 }
 
-// Encode 7680 bytes of 16-bit LE stereo PCM into 5760 bytes of 12-bit packed audio.
 static void encode_lp_frame(const unsigned char *pcm_in, unsigned char *frame_out) {
     const unsigned short *inbuf = (const unsigned short *)pcm_in;
-    int i, j = 0;
+    int j = 0;
     memset(frame_out, 0, DATA_SIZE);
-    // 1920 stereo pairs: each pair becomes 3 bytes via 12-bit non-linear + scatter
-    for (i = 0; i < LP_INPUT_SIZE / 2; i += 2) {
+    for (int i = 0; i < LP_INPUT_SIZE / 2; i += 2) {
         int left  = lp_conv_16_to_12[inbuf[i]];
         int right = lp_conv_16_to_12[inbuf[i + 1]];
-        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(left >> 4);
-        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(((left & 0xf) << 4) | (right & 0xf));
-        frame_out[lp_c_44_to_32lp[j++]] = (unsigned char)(right >> 4);
+        frame_out[g_lp_scatter[j++]] = (unsigned char)(left >> 4);
+        frame_out[g_lp_scatter[j++]] = (unsigned char)(((left & 0xf) << 4) | (right & 0xf));
+        frame_out[g_lp_scatter[j++]] = (unsigned char)(right >> 4);
     }
 }
 
@@ -308,9 +352,16 @@ void write_dat_frame(int fd, unsigned char *audio_data, int sample_rate, int pno
     mainid[0] = (unsigned char)((sr_bits << 2) | 0x00);
     mainid[1] = lp_mode ? 0x40 : 0x00;  // bit 6 = encoding: 0=16-bit SP, 1=12-bit LP
 
-    if (write(fd, frame, FRAME_SIZE) != FRAME_SIZE) {
-        perror("\n\n[FATAL ERROR] Tape drive rejected the write command");
-        exit(1);
+    if (g_write_ring) {
+        if (ring_put(g_write_ring, frame) < 0) {
+            fprintf(stderr, "\n\n[FATAL ERROR] Tape drive rejected the write command\n");
+            exit(1);
+        }
+    } else {
+        if (write(fd, frame, FRAME_SIZE) != FRAME_SIZE) {
+            perror("\n\n[FATAL ERROR] Tape drive rejected the write command");
+            exit(1);
+        }
     }
 
     g_abs_frames++;
@@ -393,14 +444,13 @@ void write_wav_file(int fd, const char *filepath, int pno, CueConfig *cfg) {
     fclose(wav);
 }
 
-int execute_record(int fd, const char *cue_file) {
+int execute_record(int fd, const char *cue_file, size_t buffer_size, int dat_batch) {
     CueConfig cfg;
     parse_cuefile(cue_file, &cfg);
 
-    if (cfg.lp_mode && !lp_tables_inited)
-        lp_init_tables();
+    if (cfg.lp_mode)
+        lp_encode_init();
 
-    // Validate files and display the playlist with durations
     validate_and_print_playlist(&cfg);
 
     printf("Rewinding tape to the beginning... Please wait.\n");
@@ -413,9 +463,38 @@ int execute_record(int fd, const char *cue_file) {
         printf(" [+] Tape rewound successfully.\n");
     }
 
+    // Set up write-side ring buffer. Producer (this thread) encodes frames
+    // and pushes them to the ring; a consumer thread issues back-to-back
+    // write() calls to keep the drive's internal buffer full without
+    // userspace gaps between SCSI commands.
+    WriteRing ring = {0};
+    if (buffer_size == 0) buffer_size = DEFAULT_BUFFER_SIZE;
+    size_t cap_frames = buffer_size / FRAME_SIZE;
+    if (cap_frames < 128) cap_frames = 128;
+    ring.data = malloc(cap_frames * FRAME_SIZE);
+    if (!ring.data) {
+        fprintf(stderr, "[ERROR] Failed to allocate %zu MB write buffer.\n",
+                (cap_frames * FRAME_SIZE) / (1024 * 1024));
+        return 1;
+    }
+    ring.cap = cap_frames;
+    ring.fd  = fd;
+    ring.batch = (dat_batch >= 1 && dat_batch <= MAX_BATCH) ? dat_batch : 1;
+
+    pthread_mutex_init(&ring.lock, NULL);
+    pthread_cond_init(&ring.avail, NULL);
+    pthread_cond_init(&ring.space, NULL);
+    pthread_create(&ring.thread, NULL, tape_writer_thread, &ring);
+    g_write_ring = &ring;
+
+    size_t buf_mb = (cap_frames * FRAME_SIZE) / (1024 * 1024);
+    printf("Buffer      : %zu MB (%zu frames)\n", buf_mb, cap_frames);
+    if (ring.batch > 1)
+        printf("Batch mode  : %d frames per SCSI WRITE (%d bytes/block) -- experimental\n",
+               ring.batch, ring.batch * FRAME_SIZE);
+
     g_abs_frames = 0;
 
-    // Silence regions use the same mode as the audio tracks
     int sr_silence = cfg.lp_mode ? 32000 : 44100;
     write_silence(fd, cfg.leadin_silence, sr_silence, "LEAD-IN", cfg.lp_mode);
 
@@ -427,6 +506,20 @@ int execute_record(int fd, const char *cue_file) {
     }
 
     write_silence(fd, cfg.leadout_silence, sr_silence, "LEAD-OUT", cfg.lp_mode);
+
+    // Drain the ring before writing the end-of-data mark
+    printf("Flushing write buffer...\n");
+    int ring_err = ring_finish(&ring);
+    g_write_ring = NULL;
+    pthread_cond_destroy(&ring.avail);
+    pthread_cond_destroy(&ring.space);
+    pthread_mutex_destroy(&ring.lock);
+    free(ring.data);
+
+    if (ring_err) {
+        fprintf(stderr, "[ERROR] A write error occurred during recording.\n");
+        return 1;
+    }
 
     mt_cmd.mt_op = MTWEOF; mt_cmd.mt_count = 1;
     ioctl(fd, MTIOCTOP, &mt_cmd);

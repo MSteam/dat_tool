@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define FRAME_SIZE 5822
-#define DATA_SIZE 5760
+#define FRAME_SIZE    5822
+#define DATA_SIZE     5760
 #define LP_INPUT_SIZE 7680  // bytes of 16-bit PCM consumed per LP frame (1920 stereo pairs)
+#define MAX_BATCH     32
 
 #pragma pack(push, 1)
 typedef struct {
@@ -33,15 +34,20 @@ typedef struct {
     int leadin_silence;
     int leadout_silence;
     int intertrack_silence;
-    int lp_mode;            // 1 = 32kHz LP (12-bit encoding); requires 32kHz input files
+    int lp_mode;
     char files[99][512];
     int file_count;
 } CueConfig;
 
-// Function prototypes
+// Shared LP scatter/gather table (same for encode and decode). Computed once.
+extern short g_lp_scatter[DATA_SIZE];
+void lp_init_scatter(void);
+
 void configure_tape_drive(int fd);
-int execute_save(int fd);
-int execute_play(int fd, size_t buffer_size);
-int execute_record(int fd, const char *cue_file);
+
+// Mode dispatch
+int execute_play  (int fd, size_t buffer_size, int dat_batch);
+int execute_save  (int fd, const char *prefix, size_t buffer_size, int dat_batch);
+int execute_record(int fd, const char *cue_file, size_t buffer_size, int dat_batch);
 
 #endif
